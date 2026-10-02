@@ -1,3 +1,6 @@
+#ifdef __PS4__
+#include "ship/port/ps4/Ps4Platform.h"
+#endif
 #include "ship/Context.h"
 #include "ship/controller/controldevice/controller/mapping/keyboard/KeyboardScancodes.h"
 #include <cstring>
@@ -172,6 +175,12 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
         GetLogger()->set_level(debugBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::trace);
+#elif defined(__PS4__)
+        // Synchronous and flushed on every message: when something goes wrong on the console the
+        // log file is the only thing left to look at.
+        mLogger = std::make_shared<spdlog::logger>(GetName(), sinks.begin(), sinks.end());
+        GetLogger()->set_level(spdlog::level::info);
+        GetLogger()->flush_on(spdlog::level::info);
 #else
         mLogThreadPool = std::make_shared<spdlog::details::thread_pool>(8192, 1);
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), mLogThreadPool,
@@ -285,6 +294,10 @@ bool Context::InitControlDeck(std::shared_ptr<ControlDeck> controlDeck) {
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) != 0) {
         SPDLOG_WARN("Failed to initialize SDL game controllers ({})", SDL_GetError());
     }
+#ifdef __PS4__
+    // No SDL joystick driver for the DualShock 4: feed it in as a virtual game controller.
+    Ship::Ps4::AttachPad();
+#endif
 
     return true;
 }
@@ -474,6 +487,11 @@ std::string Context::GetShortName() const {
 }
 
 std::string Context::GetAppBundlePath() {
+#ifdef __PS4__
+    // Read-only root of the installed package.
+    return "/app0";
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -537,6 +555,15 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(const std::string& appName) {
+#ifdef __PS4__
+    // Writable and reachable over FTP/USB: /data/<short name>
+    std::string name = appName;
+    if (name.empty() && GetRawInstance() != nullptr) {
+        name = GetRawInstance()->mShortName;
+    }
+    return "/data/" + (name.empty() ? std::string("ship") : name);
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -605,8 +632,14 @@ std::string Context::LocateFileAcrossAppDirs(const std::string& path, const std:
     if (std::filesystem::exists(fpath)) {
         return fpath;
     }
+#ifdef __PS4__
+    // Relative paths are rejected by the system (EINVAL, which std::filesystem turns into an
+    // exception): point at where the file would be in the data directory instead.
+    return GetPathRelativeToAppDirectory(path, appName);
+#else
     // current dir
     return "./" + std::string(path);
+#endif
 }
 
 } // namespace Ship

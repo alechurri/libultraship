@@ -1,6 +1,7 @@
 #include "ship/window/Window.h"
-// The PS4 (Piglet / OpenGL ES 2.0) renderer lives in gfx_opengl_ps4.cpp
-#if defined(ENABLE_OPENGL) && !defined(__PS4__)
+// OpenGL ES 2.0 renderer for PS4 (Piglet). Derived from gfx_opengl.cpp, with everything that needs
+// desktop GL / GLES3 (MSAA, glBlitFramebuffer, VAOs, depth read back, sized formats) replaced.
+#if defined(ENABLE_OPENGL) && defined(__PS4__)
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -27,6 +28,14 @@
 #include "ship/resource/factory/ShaderFactory.h"
 #include "fast/interpreter.h"
 #include "ship/config/ConsoleVariable.h"
+#include "fast/backends/gfx_opengl_ps4_shaders.h"
+#include <spdlog/spdlog.h>
+#include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <vector>
+
+#include "ship/port/ps4/Ps4Platform.h"
 
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
@@ -63,8 +72,6 @@ void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
 }
 
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
-    glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
-
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
         GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
         glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
@@ -229,7 +236,7 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     auto res = std::static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
     if (res == nullptr) {
         return std::nullopt;
     }
@@ -240,7 +247,6 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
 std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
     prism::Processor processor;
     prism::ContextItems mContext = {
-        { "VERTEX_SHADER", false },
         { "o_c", M_ARRAY(cc_features.c, int, 2, 2, 4) },
         { "o_alpha", cc_features.opt_alpha },
         { "o_fog", cc_features.opt_fog },
@@ -250,7 +256,6 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_alpha_threshold", cc_features.opt_alpha_threshold },
         { "o_invisible", cc_features.opt_invisible },
         { "o_grayscale", cc_features.opt_grayscale },
-        { "o_prim_depth", cc_features.opt_prim_depth },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -281,51 +286,15 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "SHADER_NOISE", SHADER_NOISE },
         { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
         { "append_formula", (InvokeFunc)append_formula },
-#ifdef __APPLE__
-        { "GLSL_VERSION", "#version 410 core" },
-        { "attr", "in" },
-        { "opengles", false },
-        { "core_opengl", true },
-        { "texture", "texture" },
-        { "vOutColor", "vOutColor" },
-#elif defined(USE_OPENGLES)
-        { "GLSL_VERSION", "#version 300 es\nprecision mediump float;" },
-        { "attr", "in" },
-        { "opengles", true },
-        { "core_opengl", false },
-        { "texture", "texture" },
-        { "vOutColor", "vOutColor" },
-#else
-        { "GLSL_VERSION", "#version 130" },
+        { "GLSL_VERSION", "precision mediump float;" },
         { "attr", "varying" },
         { "opengles", false },
         { "core_opengl", false },
         { "texture", "texture2D" },
         { "vOutColor", "gl_FragColor" },
-#endif
     };
     processor.populate(mContext);
-    auto init = std::make_shared<Ship::ResourceInitData>();
-    init->Type = (uint32_t)Ship::ResourceType::Shader;
-    init->ByteOrder = Ship::Endianness::Native;
-    init->Format = RESOURCE_FORMAT_BINARY;
-    const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
-
-    if (nullptr != shaderName) {
-        path = std::string(shaderName) + ".glsl";
-    }
-
-    auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
-
-    if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default fragment shader, missing f3d.o2r?");
-        abort();
-    }
-
-    auto shader = static_cast<std::string*>(res->GetRawPointer());
-    processor.load(*shader);
+    processor.load(std::string(gPs4FragmentShaderTemplate));
     processor.bind_include_loader(opengl_include_fs);
     auto result = processor.process();
     // SPDLOG_INFO("=========== FRAGMENT SHADER ============");
@@ -344,54 +313,20 @@ static prism::ContextTypes* UpdateFloats(prism::ContextTypes* _, prism::ContextT
 static std::string BuildVsShader(const CCFeatures& cc_features) {
     numFloats = 4;
     prism::Processor processor;
-    prism::ContextItems mContext = { { "VERTEX_SHADER", true },
-                                     { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
+    prism::ContextItems mContext = { { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
                                      { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
                                      { "o_fog", cc_features.opt_fog },
                                      { "o_grayscale", cc_features.opt_grayscale },
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
-#ifdef __APPLE__
-                                     { "GLSL_VERSION", "#version 410 core" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", false }
-#elif defined(USE_OPENGLES)
-                                     { "GLSL_VERSION", "#version 300 es" },
-                                     { "attr", "in" },
-                                     { "out", "out" },
-                                     { "opengles", true }
-#else
-                                     { "GLSL_VERSION", "#version 110" },
+                                     { "GLSL_VERSION", "" },
                                      { "attr", "attribute" },
                                      { "out", "varying" },
-                                     { "opengles", false }
-#endif
-    };
+                                     { "opengles", true } };
     processor.populate(mContext);
 
-    auto init = std::make_shared<Ship::ResourceInitData>();
-    init->Type = (uint32_t)Ship::ResourceType::Shader;
-    init->ByteOrder = Ship::Endianness::Native;
-    init->Format = RESOURCE_FORMAT_BINARY;
-    const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
-    std::string path = "shaders/opengl/default.shader.glsl";
-
-    if (nullptr != shaderName) {
-        path = std::string(shaderName) + ".glsl";
-    }
-
-    auto res = static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
-
-    if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default vertex shader, missing f3d.o2r?");
-        abort();
-    }
-
-    auto shader = static_cast<std::string*>(res->GetRawPointer());
-    processor.load(*shader);
+    processor.load(std::string(gPs4VertexShaderTemplate));
     processor.bind_include_loader(opengl_include_fs);
     auto result = processor.process();
     // SPDLOG_INFO("=========== VERTEX SHADER ============");
@@ -400,51 +335,139 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     return result;
 }
 
-void GfxRenderingAPIOGL::ClearShaderCache() {
-    mShaderProgramPool.clear();
+static void Ps4LogShaderSource(const std::string& source) {
+    size_t lineNumber = 1;
+    size_t start = 0;
+    while (start < source.size()) {
+        size_t end = source.find('\n', start);
+        if (end == std::string::npos) {
+            end = source.size();
+        }
+        SPDLOG_ERROR("{:4}: {}", lineNumber++, source.substr(start, end - start));
+        start = end + 1;
+    }
 }
 
-ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+static GLuint Ps4CompileShader(GLenum type, const std::string& source, const char* what) {
+    const GLchar* src = source.data();
+    const GLint length = (GLint)source.size();
+    GLint success = GL_FALSE;
+
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, &length);
+    glCompileShader(shader);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char errorLog[2048] = { 0 };
+        GLsizei logLength = 0;
+        glGetShaderInfoLog(shader, sizeof(errorLog) - 1, &logLength, errorLog);
+        SPDLOG_ERROR("[PS4] {} shader compilation failed: {}", what, errorLog);
+        Ps4LogShaderSource(source);
+        spdlog::default_logger()->flush();
+        abort();
+    }
+    return shader;
+}
+
+static GLuint Ps4LinkProgram(GLuint vertexShader, GLuint fragmentShader) {
+    GLint success = GL_FALSE;
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char errorLog[2048] = { 0 };
+        GLsizei logLength = 0;
+        glGetProgramInfoLog(program, sizeof(errorLog) - 1, &logLength, errorLog);
+        SPDLOG_ERROR("[PS4] shader program link failed: {}", errorLog);
+        spdlog::default_logger()->flush();
+        abort();
+    }
+    return program;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shader warm-up list
+//
+// Compiling a shader pair with Sony's runtime compiler takes around 200 ms, a visible hitch every
+// time the game uses a new color combiner. Piglet doesn't hand out program binaries
+// (GL_PROGRAM_BINARY_LENGTH is rejected), so they can't be cached on disk. Instead the ids of
+// every combiner the game has ever asked for are remembered in a text file and compiled up front
+// at the next start, behind the system's splash screen.
+// ---------------------------------------------------------------------------------------------
+
+static bool sWarmingUp = false;
+static constexpr size_t kMaxWarmUpShaders = 512;
+
+static std::string Ps4ShaderListPath() {
+    return Ship::Context::GetPathRelativeToAppDirectory("ps4_shaders.txt");
+}
+
+static void Ps4RememberShader(uint64_t shaderId0, uint32_t shaderId1) {
+    if (sWarmingUp) {
+        return;
+    }
+    FILE* file = fopen(Ps4ShaderListPath().c_str(), "a");
+    if (file != nullptr) {
+        fprintf(file, "%016llx %08x\n", (unsigned long long)shaderId0, (unsigned int)shaderId1);
+        fclose(file);
+    }
+}
+
+void GfxRenderingAPIOGL::WarmUpShaders() {
+    std::vector<std::pair<uint64_t, uint32_t>> ids;
+    FILE* file = fopen(Ps4ShaderListPath().c_str(), "r");
+    if (file != nullptr) {
+        unsigned long long id0 = 0;
+        unsigned int id1 = 0;
+        while (ids.size() < kMaxWarmUpShaders && fscanf(file, "%llx %x", &id0, &id1) == 2) {
+            ids.emplace_back((uint64_t)id0, (uint32_t)id1);
+        }
+        fclose(file);
+    }
+    if (ids.empty()) {
+        SPDLOG_INFO("[PS4] no shader list yet, shaders will be compiled as the game needs them");
+        return;
+    }
+
+    const Uint64 start = SDL_GetPerformanceCounter();
+    size_t compiled = 0;
+    sWarmingUp = true;
+    for (const auto& id : ids) {
+        if (LookupShader(id.first, id.second) == nullptr) {
+            CreateAndLoadNewShader(id.first, id.second);
+            compiled++;
+        }
+    }
+    sWarmingUp = false;
+    UnloadShader(mLastLoadedShader);
+
+    const double seconds = (double)(SDL_GetPerformanceCounter() - start) / (double)SDL_GetPerformanceFrequency();
+    SPDLOG_INFO("[PS4] warmed up {} shaders in {:.1f} s", compiled, seconds);
+}
+
+ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint32_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
     const auto fs_buf = BuildFsShader(cc_features);
     const auto vs_buf = BuildVsShader(cc_features);
-    const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
-    const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
-    GLint success;
-
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
-    glCompileShader(vertex_shader);
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        // fprintf(stderr, "Vertex shader compilation failed\n");
-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
-        // fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+    // Runtime compilation goes through Sony's shader compiler module and is not fast: keep a
+    // trace of how many shaders the game asked for and how long each one took.
+    static int sShaderCount = 0;
+    const Uint64 compileStart = SDL_GetPerformanceCounter();
+    GLuint vertex_shader = Ps4CompileShader(GL_VERTEX_SHADER, vs_buf, "vertex");
+    GLuint fragment_shader = Ps4CompileShader(GL_FRAGMENT_SHADER, fs_buf, "fragment");
+    GLuint shader_program = Ps4LinkProgram(vertex_shader, fragment_shader);
+    const double compileMs =
+        (double)(SDL_GetPerformanceCounter() - compileStart) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+    ++sShaderCount;
+    if (!sWarmingUp) {
+        // Only the ones that still interrupted the game are worth a line in the log.
+        SPDLOG_INFO("[PS4] shader #{} ({:016X}/{:08X}) compiled while playing in {:.1f} ms", sShaderCount, shader_id0,
+                    shader_id1, compileMs);
     }
-
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
-    glCompileShader(fragment_shader);
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        fprintf(stderr, "Fragment shader compilation failed\n");
-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
-        fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
-    }
-
-    GLuint shader_program = glCreateProgram();
-    glAttachShader(shader_program, vertex_shader);
-    glAttachShader(shader_program, fragment_shader);
-    glLinkProgram(shader_program);
+    Ps4RememberShader(shader_id0, shader_id1);
 
     size_t cnt = 0;
 
@@ -505,7 +528,6 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
 
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
-    prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
     prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
     prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
     prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
@@ -540,7 +562,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     return prg;
 }
 
-struct ShaderProgram* GfxRenderingAPIOGL::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
+struct ShaderProgram* GfxRenderingAPIOGL::LookupShader(uint64_t shader_id0, uint32_t shader_id1) {
     auto it = mShaderProgramPool.find(std::make_pair(shader_id0, shader_id1));
     return it == mShaderProgramPool.end() ? nullptr : &it->second;
 }
@@ -576,17 +598,15 @@ void GfxRenderingAPIOGL::SelectTexture(int tile, GLuint texture_id) {
 }
 
 void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0) {
-        return;
-    }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
     textures[mCurrentTextureIds[mCurrentTile]].width = width;
     textures[mCurrentTextureIds[mCurrentTile]].height = height;
 }
 
-#ifdef USE_OPENGLES
-#define GL_MIRROR_CLAMP_TO_EDGE 0x8743
-#endif
+// GLES2 has no mirror-clamp wrap mode. The fragment shader already clamps the coordinates
+// when the N64 tile asks for it, so a mirrored repeat gives the same picture.
+#undef GL_MIRROR_CLAMP_TO_EDGE
+#define GL_MIRROR_CLAMP_TO_EDGE GL_MIRRORED_REPEAT
 
 static uint32_t gfx_cm_to_opengl(uint32_t val) {
     switch (val) {
@@ -618,13 +638,6 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
 void GfxRenderingAPIOGL::SetDepthTestAndMask(bool depth_test, bool z_upd) {
     mCurrentDepthTest = depth_test;
     mCurrentDepthMask = z_upd;
-}
-
-void GfxRenderingAPIOGL::SetCurrentPrimDepth(float depth) {
-    if (depth != mCurrentPrimDepth) {
-        mCurrentPrimDepth = depth;
-        mPrimDepthDirty = true;
-    }
 }
 
 void GfxRenderingAPIOGL::SetZmodeDecal(bool zmode_decal) {
@@ -673,7 +686,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
             const int n64modeFactor = 120;
             const int noVanishFactor = 100;
             GLfloat SSDB = -2;
-            switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
+            switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
                 // scaled z-fighting (N64 mode like)
                 case 1:
                     if (mFrameBuffers.size() >
@@ -708,40 +721,67 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
     glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
 }
 
+// Depth/stencil storage used by offscreen framebuffers. Picked once from the extension list and
+// downgraded at runtime if Piglet reports an incomplete framebuffer with it.
+static GLenum sDepthFormat = GL_DEPTH_COMPONENT16;
+static bool sPackedDepthStencil = false;
+
+static bool Ps4HasExtension(const char* name) {
+    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
+    return extensions != nullptr && strstr(extensions, name) != nullptr;
+}
+
+static void Ps4AttachDepth(GLuint rbo) {
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rbo);
+    if (sPackedDepthStencil) {
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rbo);
+    }
+}
+
+static const char* Ps4GlString(GLenum name) {
+    const char* str = (const char*)glGetString(name);
+    return str != nullptr ? str : "(null)";
+}
+
+// Texture bindings are cached by SelectTexture(), so anything that binds a texture behind its
+// back has to put the previous one back.
+#define PS4_RESTORE_TEXTURE_BINDING() \
+    glBindTexture(GL_TEXTURE_2D, mLastActiveTexture >= 0 ? mLastBoundTextures[mLastActiveTexture] : 0)
+
 void GfxRenderingAPIOGL::Init() {
-#if !defined(__linux__) && !defined(__OpenBSD__)
-    glewInit();
-#endif
+    SPDLOG_INFO("[PS4] GL_VENDOR: {}", Ps4GlString(GL_VENDOR));
+    SPDLOG_INFO("[PS4] GL_RENDERER: {}", Ps4GlString(GL_RENDERER));
+    SPDLOG_INFO("[PS4] GL_VERSION: {}", Ps4GlString(GL_VERSION));
+    SPDLOG_INFO("[PS4] GL_SHADING_LANGUAGE_VERSION: {}", Ps4GlString(GL_SHADING_LANGUAGE_VERSION));
+    SPDLOG_INFO("[PS4] GL_EXTENSIONS: {}", Ps4GlString(GL_EXTENSIONS));
 
     glGenBuffers(1, &mOpenglVbo);
     glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
 
-#if defined(__APPLE__) || defined(USE_OPENGLES)
-    glGenVertexArrays(1, &mOpenglVao);
-    glBindVertexArray(mOpenglVao);
-#endif
-
-#ifndef USE_OPENGLES // not supported on gles
-    glEnable(GL_DEPTH_CLAMP);
-#endif
     glDepthFunc(GL_LEQUAL);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     mFrameBuffers.resize(1); // for the default screen buffer
 
-    glGenRenderbuffers(1, &mPixelDepthRb);
-    glBindRenderbuffer(GL_RENDERBUFFER, mPixelDepthRb);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
-    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    if (Ps4HasExtension("GL_OES_packed_depth_stencil")) {
+        sDepthFormat = GL_DEPTH24_STENCIL8_OES;
+        sPackedDepthStencil = true;
+    } else if (Ps4HasExtension("GL_OES_depth24")) {
+        sDepthFormat = GL_DEPTH_COMPONENT24_OES;
+    } else if (Ps4HasExtension("GL_OES_depth32")) {
+        // What Piglet actually offers. 16 bits are not enough once clip space z has been squeezed
+        // (see the vertex shader), distant geometry z-fights.
+        sDepthFormat = GL_DEPTH_COMPONENT32_OES;
+    } else {
+        sDepthFormat = GL_DEPTH_COMPONENT16;
+    }
+    SPDLOG_INFO("[PS4] offscreen depth format: 0x{:04X}", (unsigned int)sDepthFormat);
 
-    glGenFramebuffers(1, &mPixelDepthFb);
-    glBindFramebuffer(GL_FRAMEBUFFER, mPixelDepthFb);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, mPixelDepthRb);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // No multisampled renderbuffers on GLES2.
+    mMaxMsaaLevel = 1;
 
-    mPixelDepthRbSize = 1;
-
-    glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+    WarmUpShaders();
+    Ship::Ps4::HideSplashScreen();
 }
 
 void GfxRenderingAPIOGL::OnResize() {
@@ -762,18 +802,18 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     GLuint clrbuf;
     glGenTextures(1, &clrbuf);
     glBindTexture(GL_TEXTURE_2D, clrbuf);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    GLuint clrbufMsaa;
-    glGenRenderbuffers(1, &clrbufMsaa);
+    // Framebuffer textures are rarely power-of-two sized, which GLES2 only guarantees with clamping.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    PS4_RESTORE_TEXTURE_BINDING();
 
     GLuint rbo;
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
+    glRenderbufferStorage(GL_RENDERBUFFER, sDepthFormat, 1, 1);
     glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
     GLuint fbo;
@@ -784,8 +824,10 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
 
     mFrameBuffers[i].fbo = fbo;
     mFrameBuffers[i].clrbuf = clrbuf;
-    mFrameBuffers[i].clrbufMsaa = clrbufMsaa;
+    mFrameBuffers[i].clrbufMsaa = 0;
     mFrameBuffers[i].rbo = rbo;
+
+    textures.resize(std::max(textures.size(), (size_t)clrbuf + 1));
 
     return i;
 }
@@ -797,40 +839,55 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
 
     width = std::max(width, 1U);
     height = std::max(height, 1U);
-    msaa_level = std::min(msaa_level, (uint32_t)mMaxMsaaLevel);
+    msaa_level = 1;
 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
     if (fb_id != 0) {
-        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
-            if (msaa_level <= 1) {
-                glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
-                glBindTexture(GL_TEXTURE_2D, 0);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
-            } else {
-                glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
-                glBindRenderbuffer(GL_RENDERBUFFER, 0);
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
+        const bool sizeChanged = fb.width != width || fb.height != height;
+
+        if (sizeChanged) {
+            glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+            PS4_RESTORE_TEXTURE_BINDING();
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
+
+            if (fb.clrbuf < textures.size()) {
+                textures[fb.clrbuf].width = width;
+                textures[fb.clrbuf].height = height;
             }
         }
 
-        if (has_depth_buffer &&
-            (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || !fb.has_depth_buffer)) {
+        if (has_depth_buffer && (sizeChanged || !fb.has_depth_buffer)) {
             glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
-            if (msaa_level <= 1) {
-                glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
-            } else {
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
-            }
+            glRenderbufferStorage(GL_RENDERBUFFER, sDepthFormat, width, height);
             glBindRenderbuffer(GL_RENDERBUFFER, 0);
         }
 
         if (!fb.has_depth_buffer && has_depth_buffer) {
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fb.rbo);
+            Ps4AttachDepth(fb.rbo);
         } else if (fb.has_depth_buffer && !has_depth_buffer) {
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+            Ps4AttachDepth(0);
+        }
+
+        if (sizeChanged || fb.has_depth_buffer != has_depth_buffer) {
+            GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            if (status != GL_FRAMEBUFFER_COMPLETE && has_depth_buffer && sDepthFormat != GL_DEPTH_COMPONENT16) {
+                SPDLOG_WARN("[PS4] framebuffer {} incomplete (0x{:04X}) with depth format 0x{:04X}, using 16 bit depth",
+                            fb_id, (unsigned int)status, (unsigned int)sDepthFormat);
+                Ps4AttachDepth(0);
+                sDepthFormat = GL_DEPTH_COMPONENT16;
+                sPackedDepthStencil = false;
+                glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
+                glRenderbufferStorage(GL_RENDERBUFFER, sDepthFormat, width, height);
+                glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                Ps4AttachDepth(fb.rbo);
+                status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            }
+            if (status != GL_FRAMEBUFFER_COMPLETE) {
+                SPDLOG_ERROR("[PS4] framebuffer {} ({}x{}) is incomplete: 0x{:04X}", fb_id, width, height,
+                             (unsigned int)status);
+            }
         }
     }
 
@@ -866,45 +923,8 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
     }
 }
 
-void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
-    // Save current scissor state so callers don't need to manually invalidate.
-    GLint prevScissor[4];
-    GLboolean scissorWasEnabled = glIsEnabled(GL_SCISSOR_TEST);
-    glGetIntegerv(GL_SCISSOR_BOX, prevScissor);
-
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(x, y, w, h);
-    glDepthMask(GL_TRUE);
-    glClear(GL_DEPTH_BUFFER_BIT);
-    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
-
-    // Restore previous scissor state.
-    glScissor(prevScissor[0], prevScissor[1], prevScissor[2], prevScissor[3]);
-    if (!scissorWasEnabled) {
-        glDisable(GL_SCISSOR_TEST);
-    }
-}
-
 void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
-    FramebufferOGL& fb_dst = mFrameBuffers[fb_id_target];
-    FramebufferOGL& fb_src = mFrameBuffers[fb_id_source];
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_dst.fbo);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb_src.fbo);
-
-    // Disabled for blit
-    if (mLastScissorEnabled != 0) {
-        mLastScissorEnabled = 0;
-        glDisable(GL_SCISSOR_TEST);
-    }
-
-    glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, 0, fb_dst.width, fb_dst.height, GL_COLOR_BUFFER_BIT,
-                      GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
-
-    if (mLastScissorEnabled != 1) {
-        mLastScissorEnabled = 1;
-        glEnable(GL_SCISSOR_TEST);
-    }
+    // MSAA is never enabled on PS4 (mMaxMsaaLevel == 1), nothing to resolve.
 }
 
 void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
@@ -914,14 +934,125 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
-    GLuint texId = mFrameBuffers[fb_id].clrbuf;
-    // Ensure the textures metadata vector can hold this FB texture handle.
-    // FB color buffers are created outside NewTexture(), so the vector may
-    // not have been resized for them yet.
-    if (texId >= textures.size()) {
-        textures.resize((size_t)texId + 1);
+    SelectTexture(tile, mFrameBuffers[fb_id].clrbuf);
+}
+
+// Draws the [srcX0,srcX1]x[srcY0,srcY1] texel rectangle of `texture` over the
+// [dstX0,dstX1]x[dstY0,dstY1] pixel rectangle of `dstFbo`. Stand-in for glBlitFramebuffer, which
+// GLES2 lacks; like it, all coordinates have their origin at the bottom left.
+void GfxRenderingAPIOGL::BlitTexture(GLuint texture, int texWidth, int texHeight, int srcX0, int srcY0, int srcX1,
+                                     int srcY1, GLuint dstFbo, int dstX0, int dstY0, int dstX1, int dstY1) {
+    if (texWidth <= 0 || texHeight <= 0 || dstX0 == dstX1 || dstY0 == dstY1) {
+        return;
     }
-    SelectTexture(tile, texId);
+
+    if (mBlitProgram == 0) {
+        static const std::string vs = "attribute vec2 aPos;\n"
+                                      "attribute vec2 aUv;\n"
+                                      "varying vec2 vUv;\n"
+                                      "void main() {\n"
+                                      "    vUv = aUv;\n"
+                                      "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+                                      "}\n";
+        static const std::string fs = "precision mediump float;\n"
+                                      "varying vec2 vUv;\n"
+                                      "uniform sampler2D uTex;\n"
+                                      "void main() {\n"
+                                      "    gl_FragColor = vec4(texture2D(uTex, vUv).rgb, 1.0);\n"
+                                      "}\n";
+        GLuint vertexShader = Ps4CompileShader(GL_VERTEX_SHADER, vs, "blit vertex");
+        GLuint fragmentShader = Ps4CompileShader(GL_FRAGMENT_SHADER, fs, "blit fragment");
+        mBlitProgram = Ps4LinkProgram(vertexShader, fragmentShader);
+        mBlitPosLocation = glGetAttribLocation(mBlitProgram, "aPos");
+        mBlitUvLocation = glGetAttribLocation(mBlitProgram, "aUv");
+        glUseProgram(mBlitProgram);
+        glUniform1i(glGetUniformLocation(mBlitProgram, "uTex"), 0);
+    }
+
+    // A mirrored destination rectangle is the same as a mirrored source one.
+    if (dstX1 < dstX0) {
+        std::swap(dstX0, dstX1);
+        std::swap(srcX0, srcX1);
+    }
+    if (dstY1 < dstY0) {
+        std::swap(dstY0, dstY1);
+        std::swap(srcY0, srcY1);
+    }
+
+    // Save the state the interpreter believes is still set.
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    const GLboolean depthTestEnabled = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean blendEnabled = glIsEnabled(GL_BLEND);
+    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean polygonOffsetEnabled = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+    GLboolean depthMask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+
+    ShaderProgram* previousProgram = mLastLoadedShader;
+    if (previousProgram != nullptr) {
+        for (unsigned int i = 0; i < previousProgram->numAttribs; i++) {
+            if (previousProgram->attribLocations[i] >= 0) {
+                glDisableVertexAttribArray(previousProgram->attribLocations[i]);
+            }
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthMask(GL_FALSE);
+    glViewport(dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
+
+    const float u0 = (float)srcX0 / (float)texWidth;
+    const float u1 = (float)srcX1 / (float)texWidth;
+    const float v0 = (float)srcY0 / (float)texHeight;
+    const float v1 = (float)srcY1 / (float)texHeight;
+    const float vertices[] = {
+        -1.0f, -1.0f, u0, v0, 1.0f, -1.0f, u1, v0, -1.0f, 1.0f, u0, v1,
+        1.0f,  -1.0f, u1, v0, 1.0f, 1.0f,  u1, v1, -1.0f, 1.0f, u0, v1,
+    };
+
+    glUseProgram(mBlitProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+
+    // mOpenglVbo stays bound to GL_ARRAY_BUFFER for the whole lifetime of the renderer and
+    // DrawTriangles() re-uploads it on every draw, so it can be borrowed here.
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
+    glEnableVertexAttribArray(mBlitPosLocation);
+    glVertexAttribPointer(mBlitPosLocation, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(mBlitUvLocation);
+    glVertexAttribPointer(mBlitUvLocation, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(mBlitPosLocation);
+    glDisableVertexAttribArray(mBlitUvLocation);
+
+    // Restore.
+    glBindTexture(GL_TEXTURE_2D, mLastBoundTextures[0]);
+    if (mLastActiveTexture > 0) {
+        glActiveTexture(GL_TEXTURE0 + mLastActiveTexture);
+    }
+    if (previousProgram != nullptr) {
+        glUseProgram(previousProgram->openglProgramId);
+        VertexArraySetAttribs(previousProgram);
+    }
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    if (depthTestEnabled) {
+        glEnable(GL_DEPTH_TEST);
+    }
+    if (blendEnabled) {
+        glEnable(GL_BLEND);
+    }
+    if (scissorEnabled) {
+        glEnable(GL_SCISSOR_TEST);
+    }
+    if (polygonOffsetEnabled) {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+    }
+    glDepthMask(depthMask);
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -930,8 +1061,8 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         return;
     }
 
-    FramebufferOGL src = mFrameBuffers[fb_src_id];
-    const FramebufferOGL& dst = mFrameBuffers[fb_dst_id];
+    const FramebufferOGL src = mFrameBuffers[fb_src_id];
+    const FramebufferOGL dst = mFrameBuffers[fb_dst_id];
 
     // Adjust y values for non-inverted source frame buffers because opengl uses bottom left for origin
     if (!src.invertY) {
@@ -945,55 +1076,50 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         std::swap(srcY0, srcY1);
     }
 
-    // Disabled for blit
-    if (mLastScissorEnabled != 0) {
-        mLastScissorEnabled = 0;
-        glDisable(GL_SCISSOR_TEST);
-    }
+    GLuint srcTexture = src.clrbuf;
+    int srcWidth = src.width;
+    int srcHeight = src.height;
 
-    // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
-    // First do an unscaled blit to a msaa resolved buffer
-    if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
-        // Start with the main buffer (0) as the msaa resolved buffer
-        int fb_resolve_id = 0;
-        FramebufferOGL fb_resolve = mFrameBuffers[fb_resolve_id];
-
-        // If the size doesn't match our source, then we need to use our separate color msaa resolved buffer (2)
-        if (fb_resolve.height != src.height || fb_resolve.width != src.width) {
-            fb_resolve_id = 2;
-            fb_resolve = mFrameBuffers[fb_resolve_id];
+    if (fb_src_id == 0) {
+        // The screen can't be sampled: grab the requested rectangle into a scratch texture first.
+        const int x0 = std::max(std::min(srcX0, srcX1), 0);
+        const int y0 = std::max(std::min(srcY0, srcY1), 0);
+        const int x1 = std::min(std::max(srcX0, srcX1), (int)src.width);
+        const int y1 = std::min(std::max(srcY0, srcY1), (int)src.height);
+        if (x1 <= x0 || y1 <= y0) {
+            return;
         }
 
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_resolve.fbo);
+        if (mLastActiveTexture != 0) {
+            glActiveTexture(GL_TEXTURE0);
+        }
+        if (mBlitScratchTexture == 0) {
+            glGenTextures(1, &mBlitScratchTexture);
+            glBindTexture(GL_TEXTURE_2D, mBlitScratchTexture);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            textures.resize(std::max(textures.size(), (size_t)mBlitScratchTexture + 1));
+        } else {
+            glBindTexture(GL_TEXTURE_2D, mBlitScratchTexture);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x0, y0, x1 - x0, y1 - y0, 0);
+        // BlitTexture() restores the texture unit/binding the interpreter expects.
 
-        glBlitFramebuffer(0, 0, src.width, src.height, 0, 0, src.width, src.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-        // Switch source buffer to the resolved sample
-        fb_src_id = fb_resolve_id;
-        src = fb_resolve;
+        srcTexture = mBlitScratchTexture;
+        srcWidth = x1 - x0;
+        srcHeight = y1 - y0;
+        srcX0 -= x0;
+        srcX1 -= x0;
+        srcY0 -= y0;
+        srcY1 -= y0;
     }
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
-
-    // The 0 buffer is a double buffer so we need to choose the back to avoid imgui elements
-    if (fb_src_id == 0) {
-        glReadBuffer(GL_BACK);
-    } else {
-        glReadBuffer(GL_COLOR_ATTACHMENT0);
-    }
-
-    glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    BlitTexture(srcTexture, srcWidth, srcHeight, srcX0, srcY0, srcX1, srcY1, dst.fbo, dstX0, dstY0, dstX1, dstY1);
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
-
-    glReadBuffer(GL_BACK);
-
-    if (mLastScissorEnabled != 1) {
-        mLastScissorEnabled = 1;
-        glEnable(GL_SCISSOR_TEST);
-    }
 }
 
 void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
@@ -1001,91 +1127,33 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
         return;
     }
 
-    // Read as RGBA8 (GL_UNSIGNED_BYTE) then convert to RGBA16 (5551).
-    // GL_RGBA + GL_UNSIGNED_SHORT_5_5_5_1 writes 4 separate u16 components per pixel
-    // (8 bytes) on some drivers (NVIDIA), not the packed 2 bytes the spec implies.
-    // Reading as RGBA8 and converting matches the DX11 path's approach.
+    // GLES2 only guarantees RGBA/UNSIGNED_BYTE read back, convert to RGBA5551 by hand.
+    std::vector<uint8_t> rgba32(static_cast<size_t>(width) * height * 4);
+
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[fb_id].fbo);
-
-    std::vector<uint8_t> rgba8(width * height * 4);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
-
-    for (uint32_t i = 0; i < width * height; i++) {
-        uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
-        uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;
-        uint8_t b = (rgba8[i * 4 + 2] >> 3) & 0x1F;
-        uint8_t a = rgba8[i * 4 + 3] ? 1 : 0;
-        rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | a;
-    }
-
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba32.data());
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+
+    const size_t pixels = static_cast<size_t>(width) * height;
+    for (size_t i = 0; i < pixels; i++) {
+        const uint8_t r = rgba32[i * 4 + 0];
+        const uint8_t g = rgba32[i * 4 + 1];
+        const uint8_t b = rgba32[i * 4 + 2];
+        const uint8_t a = rgba32[i * 4 + 3];
+        rgba16_buf[i] = (uint16_t)(((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7));
+    }
 }
 
 std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
 GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
 
-    FramebufferOGL& fb = mFrameBuffers[fb_id];
-
-    // When looking up one value and the framebuffer is single-sampled, we can read pixels directly
-    // Otherwise we need to blit first to a new buffer then read it
-    if (coordinates.size() == 1 && fb.msaa_level <= 1) {
-        uint32_t depth_stencil_value;
-        glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
-        int x = coordinates.begin()->first;
-        int y = coordinates.begin()->second;
-#ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
-        glReadPixels(x, fb.invertY ? fb.height - y : y, 1, 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8,
-                     &depth_stencil_value);
-#endif
-        res.emplace(*coordinates.begin(), (depth_stencil_value >> 18) << 2);
-    } else {
-        if (mPixelDepthRbSize < coordinates.size()) {
-            // Resizing a renderbuffer seems broken with Intel's driver, so recreate one instead.
-            glBindFramebuffer(GL_FRAMEBUFFER, mPixelDepthFb);
-            glDeleteRenderbuffers(1, &mPixelDepthRb);
-            glGenRenderbuffers(1, &mPixelDepthRb);
-            glBindRenderbuffer(GL_RENDERBUFFER, mPixelDepthRb);
-            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, coordinates.size(), 1);
-            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, mPixelDepthRb);
-            glBindRenderbuffer(GL_RENDERBUFFER, 0);
-
-            mPixelDepthRbSize = coordinates.size();
-        }
-
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mPixelDepthFb);
-
-        glDisable(GL_SCISSOR_TEST); // needed for the blit operation
-
-        {
-            size_t i = 0;
-            for (const auto& coord : coordinates) {
-                int x = coord.first;
-                int y = coord.second;
-                if (fb.invertY) {
-                    y = fb.height - y;
-                }
-                glBlitFramebuffer(x, y, x + 1, y + 1, i, 0, i + 1, 1, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
-                                  GL_NEAREST);
-                ++i;
-            }
-        }
-
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, mPixelDepthFb);
-        std::vector<uint32_t> depth_stencil_values(coordinates.size());
-#ifndef USE_OPENGLES // not supported on gles. Runs fine without it, but this may cause issues
-        glReadPixels(0, 0, coordinates.size(), 1, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, depth_stencil_values.data());
-#endif
-        {
-            size_t i = 0;
-            for (const auto& coord : coordinates) {
-                res.emplace(coord, (depth_stencil_values[i++] >> 18) << 2);
-            }
-        }
+    // The depth buffer can't be read back on GLES2. Report "nothing in front" so that light glows
+    // and lens flares, the only users of this, are always drawn.
+    for (const auto& coord : coordinates) {
+        res.emplace(coord, (uint16_t)0xFFFC);
     }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
 
     return res;
 }
@@ -1108,5 +1176,3 @@ ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
 }
 } // namespace Fast
 #endif
-
-#pragma clang diagnostic pop

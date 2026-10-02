@@ -100,6 +100,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "PS4")
+    set(Source_Files__Port
+        ${CMAKE_CURRENT_SOURCE_DIR}/port/ps4/Ps4Platform.cpp
+    )
+endif()
 source_group("port" FILES ${Source_Files__Port})
 target_sources(libultraship PRIVATE ${Source_Files__Port})
 
