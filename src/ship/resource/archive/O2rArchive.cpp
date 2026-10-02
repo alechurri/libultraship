@@ -4,7 +4,70 @@
 #include "ship/window/Window.h"
 #include "spdlog/spdlog.h"
 
+#ifdef __PS4__
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#endif
+
 namespace Ship {
+#ifdef __PS4__
+// Fallback for when libzip can't work on the file itself: read the whole archive and let libzip
+// parse it from memory (it takes ownership of the buffer).
+static zip_t* Ps4OpenZipFromMemory(const std::string& path) {
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        SPDLOG_ERROR("[PS4] fopen(\"{}\") failed: {}", path, strerror(errno));
+        return nullptr;
+    }
+
+    fseek(file, 0, SEEK_END);
+    const long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0) {
+        SPDLOG_ERROR("[PS4] \"{}\" reports a size of {} bytes", path, size);
+        fclose(file);
+        return nullptr;
+    }
+
+    void* data = malloc((size_t)size);
+    if (data == nullptr) {
+        SPDLOG_ERROR("[PS4] out of memory reading \"{}\" ({} bytes)", path, size);
+        fclose(file);
+        return nullptr;
+    }
+
+    const size_t bytesRead = fread(data, 1, (size_t)size, file);
+    fclose(file);
+    if (bytesRead != (size_t)size) {
+        SPDLOG_ERROR("[PS4] short read on \"{}\": {} of {} bytes", path, bytesRead, size);
+        free(data);
+        return nullptr;
+    }
+
+    zip_error_t error;
+    zip_error_init(&error);
+    zip_source_t* source = zip_source_buffer_create(data, (zip_uint64_t)size, 1, &error);
+    if (source == nullptr) {
+        SPDLOG_ERROR("[PS4] zip_source_buffer_create failed: {}", zip_error_strerror(&error));
+        free(data);
+        zip_error_fini(&error);
+        return nullptr;
+    }
+
+    zip_t* archive = zip_open_from_source(source, ZIP_RDONLY, &error);
+    if (archive == nullptr) {
+        SPDLOG_ERROR("[PS4] zip_open_from_source(\"{}\") failed: {}", path, zip_error_strerror(&error));
+        zip_source_free(source);
+    } else {
+        SPDLOG_INFO("[PS4] \"{}\" opened from memory ({} bytes)", path, size);
+    }
+    zip_error_fini(&error);
+    return archive;
+}
+#endif
+
 O2rArchive::O2rArchive(const std::string& archivePath) : Archive(archivePath) {
 }
 
@@ -67,7 +130,20 @@ std::shared_ptr<File> O2rArchive::LoadFile(const std::string& filePath) {
 }
 
 bool O2rArchive::Open() {
+#ifdef __PS4__
+    // Archives are never written on the console, and the one inside the package is on a read-only
+    // file system.
+    int zipError = 0;
+    errno = 0;
+    mZipArchive = zip_open(GetPath().c_str(), ZIP_RDONLY, &zipError);
+    if (mZipArchive == nullptr) {
+        SPDLOG_WARN("[PS4] zip_open(\"{}\") failed (libzip error {}, errno {}: {}), trying from memory", GetPath(),
+                    zipError, errno, strerror(errno));
+        mZipArchive = Ps4OpenZipFromMemory(GetPath());
+    }
+#else
     mZipArchive = zip_open(GetPath().c_str(), ZIP_CREATE, nullptr);
+#endif
     if (mZipArchive == nullptr) {
         SPDLOG_ERROR("Failed to load zip file \"{}\"", GetPath());
         return false;

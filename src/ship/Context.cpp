@@ -149,6 +149,12 @@ bool Context::InitLogging(spdlog::level::level_enum debugBuildLogLevel,
         mLogger = std::make_shared<spdlog::logger>("multi_sink", sinks.begin(), sinks.end());
         GetLogger()->set_level(debugBuildLogLevel);
         GetLogger()->flush_on(spdlog::level::trace);
+#elif defined(__PS4__)
+        // Synchronous and flushed on every message: when something goes wrong on the console the
+        // log file is the only thing left to look at.
+        mLogger = std::make_shared<spdlog::logger>(GetName(), sinks.begin(), sinks.end());
+        GetLogger()->set_level(spdlog::level::info);
+        GetLogger()->flush_on(spdlog::level::info);
 #else
         mLogger = std::make_shared<spdlog::async_logger>(GetName(), sinks.begin(), sinks.end(), spdlog::thread_pool(),
                                                          spdlog::async_overflow_policy::block);
@@ -392,6 +398,11 @@ std::string Context::GetShortName() {
 }
 
 std::string Context::GetAppBundlePath() {
+#ifdef __PS4__
+    // Read-only root of the installed package.
+    return "/app0";
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -455,6 +466,14 @@ std::string Context::GetAppBundlePath() {
 }
 
 std::string Context::GetAppDirectoryPath(std::string appName) {
+#ifdef __PS4__
+    // Writable and reachable over FTP/USB: /data/<short name>
+    if (appName.empty() && GetInstance() != nullptr) {
+        appName = GetInstance()->mShortName;
+    }
+    return "/data/" + (appName.empty() ? std::string("ship") : appName);
+#endif
+
 #if defined(__ANDROID__)
     const char* externaldir = SDL_AndroidGetExternalStoragePath();
     if (externaldir != NULL) {
@@ -520,8 +539,14 @@ std::string Context::LocateFileAcrossAppDirs(const std::string path, std::string
     if (std::filesystem::exists(fpath)) {
         return fpath;
     }
+#ifdef __PS4__
+    // Relative paths are rejected by the system (EINVAL, which std::filesystem turns into an
+    // exception): point at where the file would be in the data directory instead.
+    return GetPathRelativeToAppDirectory(path, appName);
+#else
     // current dir
     return "./" + std::string(path);
+#endif
 }
 
 } // namespace Ship

@@ -1,6 +1,9 @@
 #include "libultraship/libultraship.h"
 #include <SDL2/SDL.h>
 #include <ratio>
+#ifdef __PS4__
+#include "ship/port/ps4/Ps4Platform.h"
+#endif
 
 // Establish a chrono duration for the N64 46.875MHz clock rate
 typedef std::ratio<3000, 64> n64ClockRatio;
@@ -28,6 +31,11 @@ int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* statu
         SPDLOG_ERROR("Failed to initialize SDL game controllers ({})", SDL_GetError());
         exit(EXIT_FAILURE);
     }
+
+#ifdef __PS4__
+    // No SDL joystick driver for the DualShock 4: feed it in as a virtual game controller.
+    Ship::Ps4::AttachPad();
+#endif
 
     Ship::Context::GetInstance()->GetControlDeck()->Init(controllerBits);
 

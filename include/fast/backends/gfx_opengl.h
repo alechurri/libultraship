@@ -16,6 +16,12 @@
 #elif __APPLE__
 #include <SDL2/SDL.h>
 #include <GL/glew.h>
+#elif defined(__PS4__)
+// Piglet: OpenGL ES 2.0 + EGL 1.4
+#include <stdint.h>
+#include <stdbool.h>
+#include <SDL2/SDL.h>
+#include <orbis/Pigletv2VSH.h>
 #elif USE_OPENGLES
 #include <SDL2/SDL.h>
 #include <GLES3/gl3.h>
@@ -105,6 +111,15 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+#ifdef __PS4__
+    void WarmUpShaders();
+    void BlitTexture(GLuint texture, int texWidth, int texHeight, int srcX0, int srcY0, int srcX1, int srcY1,
+                     GLuint dstFbo, int dstX0, int dstY0, int dstX1, int dstY1);
+    GLuint mBlitProgram = 0;
+    GLint mBlitPosLocation = -1;
+    GLint mBlitUvLocation = -1;
+    GLuint mBlitScratchTexture = 0;
+#endif
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES];

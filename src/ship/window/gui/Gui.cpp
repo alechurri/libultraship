@@ -211,6 +211,9 @@ void Gui::ImGuiBackendInit() {
         case WindowBackend::FAST3D_SDL_OPENGL:
 #ifdef __APPLE__
             ImGui_ImplOpenGL3_Init("#version 410 core");
+#elif defined(__PS4__)
+            // GLES2 shaders; the directive itself is stripped before it reaches Piglet.
+            ImGui_ImplOpenGL3_Init("#version 100");
 #elif USE_OPENGLES
             ImGui_ImplOpenGL3_Init("#version 300 es");
 #else
@@ -272,7 +275,7 @@ bool Gui::SupportsViewports() {
     }
 #endif
 
-#if defined(__ANDROID__) || defined(__IOS__)
+#if defined(__ANDROID__) || defined(__IOS__) || defined(__PS4__)
     return false;
 #endif
 

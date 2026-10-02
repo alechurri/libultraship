@@ -23,6 +23,10 @@
 #include <SDL.h>
 #include "fast/backends/gfx_metal.h"
 #include "ship/utils/macUtils.h"
+#elif defined(__PS4__)
+// SDL only provides events/timing here (dummy video driver); the GL context comes from Piglet.
+#include <SDL2/SDL.h>
+#include "ship/port/ps4/Ps4Platform.h"
 #else
 #include <SDL2/SDL.h>
 #define GL_GLEXT_PROTOTYPES 1
@@ -207,6 +211,10 @@ GfxWindowBackendSDL2::~GfxWindowBackendSDL2() {
 }
 
 void GfxWindowBackendSDL2::SetFullscreenImpl(bool on, bool call_callback) {
+#ifdef __PS4__
+    // Always fullscreen.
+    return;
+#endif
     if (mFullScreen == on) {
         return;
     }
@@ -311,6 +319,15 @@ static LRESULT CALLBACK gfx_sdl_wnd_proc(HWND h_wnd, UINT message, WPARAM w_para
 
 void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bool startFullScreen, uint32_t width,
                                 uint32_t height, int32_t posX, int32_t posY) {
+#ifdef __PS4__
+    // Piglet presents to a fixed 1080p window, whatever the config file says.
+    width = Ship::Ps4::kDisplayWidth;
+    height = Ship::Ps4::kDisplayHeight;
+    posX = 0;
+    posY = 0;
+    // The only video driver built into SDL for this platform; it has to be asked for by name.
+    SDL_SetHint(SDL_HINT_VIDEODRIVER, "dummy");
+#endif
     mWindowWidth = width;
     mWindowHeight = height;
 
@@ -319,7 +336,12 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
-    SDL_Init(SDL_INIT_VIDEO);
+#ifdef __PS4__
+    SPDLOG_INFO("[PS4] window init: SDL_Init");
+#endif
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        SPDLOG_ERROR("SDL_Init(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
+    }
 
     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
 
@@ -358,17 +380,28 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
 
 #ifdef __IOS__
     Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
+#elif defined(__PS4__)
+    // A plain window on the dummy driver: it only exists so SDL/ImGui have something to report sizes for.
+    Uint32 flags = SDL_WINDOW_SHOWN;
 #else
     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #endif
 
+#ifndef __PS4__
     if (use_opengl) {
         flags = flags | SDL_WINDOW_OPENGL;
     } else {
         flags = flags | SDL_WINDOW_METAL;
     }
+#endif
 
     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
+#ifdef __PS4__
+    if (mWnd == nullptr) {
+        SPDLOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
+    }
+    mRenderer = nullptr;
+#endif
 #ifdef _WIN32
     // Get Windows window handle and use it to subclass the window procedure.
     // Needed to circumvent SDLs DPI scaling problems under windows (original does only scale *sometimes*).
@@ -387,7 +420,20 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         posY = 100;
     }
 
+#ifdef __PS4__
+    if (!Ship::Ps4::InitGraphics(mWindowWidth, mWindowHeight)) {
+        SPDLOG_CRITICAL("[PS4] could not create the GLES context, giving up");
+        spdlog::default_logger()->flush();
+        abort();
+    }
+    Ship::Ps4::SetSwapInterval(mVsyncEnabled ? 1 : 0);
+    mCtx = static_cast<SDL_GLContext>(Ship::Ps4::GetGlContext());
+    mFullScreen = true;
+    window_impl.Opengl = { mWnd, mCtx };
+    if (false) {
+#else
     if (use_opengl) {
+#endif
         SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 
         if (startFullScreen) {
@@ -400,7 +446,11 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
 
         window_impl.Opengl = { mWnd, mCtx };
+#ifdef __PS4__
+    } else if (false) {
+#else
     } else {
+#endif
         uint32_t flags = SDL_RENDERER_ACCELERATED;
         if (mVsyncEnabled) {
             flags |= SDL_RENDERER_PRESENTVSYNC;
@@ -688,12 +738,41 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
 
     if (mVsyncEnabled != nextVsyncEnabled) {
         mVsyncEnabled = nextVsyncEnabled;
+#ifdef __PS4__
+        Ship::Ps4::SetSwapInterval(mVsyncEnabled ? 1 : 0);
+#else
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+#endif
     }
 
     SyncFramerateWithTime();
+#ifdef __PS4__
+    {
+        // Heartbeat: shows in the log whether frames keep being presented, and how fast.
+        static uint32_t sFrames = 0;
+        static Uint64 sLast = 0;
+        sFrames++;
+        if (sFrames <= 5 || sFrames % 1800 == 0) {
+            const Uint64 now = SDL_GetPerformanceCounter();
+            const double seconds = sLast != 0 ? (double)(now - sLast) / (double)SDL_GetPerformanceFrequency() : 0.0;
+            SPDLOG_INFO("[PS4] presenting frame {} ({:.2f} s since the last heartbeat)", sFrames, seconds);
+            sLast = now;
+        }
+        if (sFrames == 5 || sFrames % 3600 == 0) {
+            Ship::Ps4::LogMemoryStats("while running");
+        }
+    }
+    Ship::Ps4::SwapBuffers();
+    {
+        static uint32_t sPresented = 0;
+        if (++sPresented <= 5) {
+            SPDLOG_INFO("[PS4] frame {} presented", sPresented);
+        }
+    }
+#else
     SDL_GL_SwapWindow(mWnd);
+#endif
 }
 
 void GfxWindowBackendSDL2::SwapBuffersEnd() {
@@ -729,10 +808,16 @@ bool GfxWindowBackendSDL2::IsRunning() {
 
 void GfxWindowBackendSDL2::Destroy() {
     // TODO: destroy _any_ resources used by SDL
+#ifdef __PS4__
+    Ship::Ps4::ShutdownGraphics();
+    SDL_DestroyWindow(mWnd);
+    SDL_Quit();
+#else
     SDL_GL_DeleteContext(mCtx);
     SDL_DestroyWindow(mWnd);
     SDL_DestroyRenderer(mRenderer);
     SDL_Quit();
+#endif
 }
 
 bool GfxWindowBackendSDL2::IsFullscreen() {

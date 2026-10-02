@@ -3958,11 +3958,15 @@ class UcodeHandler {
   public:
     inline constexpr UcodeHandler(
         std::initializer_list<std::pair<int8_t, std::pair<const char*, GfxOpcodeHandlerFunc>>> initializer) {
-        std::fill(std::begin(mHandlers), std::end(mHandlers),
-                  std::pair<const char*, GfxOpcodeHandlerFunc>(nullptr, nullptr));
+        // Plain loops instead of std::fill/pair assignment: neither is constexpr in older libc++ releases.
+        for (auto& handler : mHandlers) {
+            handler.first = nullptr;
+            handler.second = nullptr;
+        }
 
-        for (const auto& [opcode, handler] : initializer) {
-            mHandlers[static_cast<uint8_t>(opcode)] = handler;
+        for (const auto& entry : initializer) {
+            mHandlers[static_cast<uint8_t>(entry.first)].first = entry.second.first;
+            mHandlers[static_cast<uint8_t>(entry.first)].second = entry.second.second;
         }
     }
 
@@ -3975,7 +3979,7 @@ class UcodeHandler {
     }
 
   private:
-    std::pair<const char*, GfxOpcodeHandlerFunc> mHandlers[std::numeric_limits<uint8_t>::max() + 1];
+    std::pair<const char*, GfxOpcodeHandlerFunc> mHandlers[std::numeric_limits<uint8_t>::max() + 1]{};
 };
 
 static constexpr UcodeHandler rdpHandlers = {
@@ -4305,6 +4309,12 @@ bool Interpreter::IsFrameReady() {
 }
 
 bool Interpreter::ViewportMatchesRendererResolution() {
+#ifdef __PS4__
+    // Always render the game into its own framebuffer. Effects that capture the picture (pause
+    // screen, transitions) can then sample that texture; capturing from the window surface
+    // instead goes through glCopyTexImage2D, which takes seconds on Piglet.
+    return false;
+#endif
 #ifdef __APPLE__
     // Always treat the viewport as not matching the render resolution on mac
     // to avoid issues with retina scaling.
