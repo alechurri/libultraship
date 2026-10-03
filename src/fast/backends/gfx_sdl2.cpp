@@ -801,8 +801,18 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
 #endif
     }
 
+#ifdef __PS4__
+    const Uint64 ps4PaceStart = SDL_GetPerformanceCounter();
+#endif
     SyncFramerateWithTime();
 #ifdef __PS4__
+    // Time split per presented frame: sleeping to keep the pace, waiting in eglSwapBuffers (GPU), and
+    // the rest (building and submitting the frame on the CPU).
+    static double sPaceMs = 0.0;
+    static double sSwapMs = 0.0;
+    static double sSwapMaxMs = 0.0;
+    const Uint64 ps4SwapStart = SDL_GetPerformanceCounter();
+    sPaceMs += (double)(ps4SwapStart - ps4PaceStart) * 1000.0 / (double)SDL_GetPerformanceFrequency();
     {
         // Heartbeat: shows in the log whether frames keep being presented, and how fast.
         static uint32_t sFrames = 0;
@@ -811,7 +821,18 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         if (sFrames <= 5 || sFrames % 1800 == 0) {
             const Uint64 now = SDL_GetPerformanceCounter();
             const double seconds = sLast != 0 ? (double)(now - sLast) / (double)SDL_GetPerformanceFrequency() : 0.0;
-            SPDLOG_INFO("[PS4] presenting frame {} ({:.2f} s since the last heartbeat)", sFrames, seconds);
+            if (sFrames % 1800 == 0) {
+                const double frameMs = seconds * 1000.0 / 1800.0;
+                SPDLOG_INFO("[PS4] presenting frame {} ({:.2f} s since the last heartbeat; per frame {:.1f} ms: "
+                            "pacing sleep {:.1f}, GPU/swap {:.1f} (max {:.1f}), CPU build {:.1f})",
+                            sFrames, seconds, frameMs, sPaceMs / 1800.0, sSwapMs / 1800.0, sSwapMaxMs,
+                            frameMs - sPaceMs / 1800.0 - sSwapMs / 1800.0);
+            } else {
+                SPDLOG_INFO("[PS4] presenting frame {} ({:.2f} s since the last heartbeat)", sFrames, seconds);
+            }
+            sPaceMs = 0.0;
+            sSwapMs = 0.0;
+            sSwapMaxMs = 0.0;
             sLast = now;
         }
         if (sFrames == 5 || sFrames % 3600 == 0) {
@@ -819,6 +840,12 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         }
     }
     Ship::Ps4::SwapBuffers();
+    {
+        const double swapMs =
+            (double)(SDL_GetPerformanceCounter() - ps4SwapStart) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+        sSwapMs += swapMs;
+        sSwapMaxMs = swapMs > sSwapMaxMs ? swapMs : sSwapMaxMs;
+    }
     {
         static uint32_t sPresented = 0;
         if (++sPresented <= 5) {
