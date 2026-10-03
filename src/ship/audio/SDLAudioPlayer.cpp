@@ -172,7 +172,8 @@ void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
     const size_t frames = len / (sizeof(int16_t) * (size_t)mNumChannels);
 
     std::lock_guard<std::mutex> lock(sQueueMutex);
-    if ((sQueue.size() - sQueueRead) / 2 >= 6000) {
+    // Room for the 100 ms cushion plus a few game frames of audio (BenPort adds an update when low).
+    if ((sQueue.size() - sQueueRead) / 2 >= 12000) {
         // Don't fill the audio buffer too much in case this happens
         sDroppedBuffers.fetch_add(1);
         return;
