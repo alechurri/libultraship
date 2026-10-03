@@ -138,7 +138,13 @@ bool SDLAudioPlayer::DoInit() {
 
 int SDLAudioPlayer::Buffered() {
     std::lock_guard<std::mutex> lock(sQueueMutex);
-    return (int)((sQueue.size() - sQueueRead) / 2);
+    // The system output has no buffer of its own beyond one 256 frame block, so a game tick that
+    // runs a little late (20 Hz games refill once every 50 ms) used to drain the queue and cut
+    // the sound. Under-report by a fixed cushion: the game's buffering logic then keeps that many
+    // extra frames queued (~40 ms at 32 kHz).
+    constexpr int kCushionFrames = 1280;
+    const int queued = (int)((sQueue.size() - sQueueRead) / 2);
+    return queued > kCushionFrames ? queued - kCushionFrames : 0;
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
