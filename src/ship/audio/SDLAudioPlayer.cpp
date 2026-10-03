@@ -22,6 +22,9 @@ constexpr uint32_t kGranularity = 256;
 constexpr int32_t kSystemUserId = 0xFF;
 
 std::mutex sQueueMutex;
+// Diagnostics, read and reset by Ps4Audio_TakeStats().
+std::atomic<uint32_t> sDroppedBuffers{ 0 };
+std::atomic<uint32_t> sStarvedBlocks{ 0 };
 std::vector<int16_t> sQueue; // interleaved stereo frames at the game's sample rate
 size_t sQueueRead = 0;       // index of the first unread sample in sQueue
 std::thread sFeeder;
@@ -40,6 +43,7 @@ void FeederThread() {
             const size_t available = (sQueue.size() - sQueueRead) / 2;
             const int16_t* frames = sQueue.data() + sQueueRead;
 
+            bool starved = false;
             for (uint32_t i = 0; i < kGranularity; i++) {
                 const size_t index = (size_t)position;
                 if (index + 1 < available) {
@@ -56,7 +60,11 @@ void FeederThread() {
                     // Underrun: play silence until the game catches up.
                     block[i * 2 + 0] = 0;
                     block[i * 2 + 1] = 0;
+                    starved = true;
                 }
+            }
+            if (starved) {
+                sStarvedBlocks.fetch_add(1);
             }
 
             size_t consumed = (size_t)position;
@@ -104,6 +112,14 @@ void SDLAudioPlayer::DoClose() {
     mDevice = 0;
 }
 
+} // namespace Ship
+
+extern "C" void Ps4Audio_TakeStats(uint32_t* droppedBuffers, uint32_t* starvedBlocks) {
+    *droppedBuffers = Ship::sDroppedBuffers.exchange(0);
+    *starvedBlocks = Ship::sStarvedBlocks.exchange(0);
+}
+
+namespace Ship {
 bool SDLAudioPlayer::DoInit() {
     mNumChannels = this->GetNumOutputChannels();
     sSourceRate = (uint32_t)this->GetSampleRate();
@@ -158,6 +174,7 @@ void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
     std::lock_guard<std::mutex> lock(sQueueMutex);
     if ((sQueue.size() - sQueueRead) / 2 >= 6000) {
         // Don't fill the audio buffer too much in case this happens
+        sDroppedBuffers.fetch_add(1);
         return;
     }
 
