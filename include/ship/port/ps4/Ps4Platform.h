@@ -17,6 +17,10 @@ constexpr int kDisplayHeight = 1080;
 
 // Loads the system modules + Piglet and creates the EGL window surface and GLES2 context.
 // Returns false (after logging the reason) if anything fails.
+// Loads the system modules the port calls into (user service, pad, audio...). Safe to call more
+// than once; everything that touches one of them calls this first, since the order in which the
+// engine sets up input, audio and the window differs between versions.
+bool LoadSystemModules();
 bool InitGraphics(int width, int height);
 // Takes down the system's boot splash; call once the first frame is about to be drawn.
 void HideSplashScreen();

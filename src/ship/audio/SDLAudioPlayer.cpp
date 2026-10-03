@@ -7,6 +7,7 @@
 // resamples (linear interpolation) and hands 256 frame blocks to the system.
 
 #include <orbis/AudioOut.h>
+#include "ship/port/ps4/Ps4Platform.h"
 
 #include <atomic>
 #include <cstring>
@@ -107,6 +108,7 @@ bool SDLAudioPlayer::DoInit() {
     mNumChannels = this->GetNumOutputChannels();
     sSourceRate = (uint32_t)this->GetSampleRate();
 
+    Ship::Ps4::LoadSystemModules();
     // Returns an "already initialized" error when called twice, which is fine.
     sceAudioOutInit();
 

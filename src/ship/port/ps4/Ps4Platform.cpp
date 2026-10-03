@@ -1,6 +1,7 @@
 #ifdef __PS4__
 
 #include "ship/port/ps4/Ps4Platform.h"
+#include "ship/Context.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -51,10 +52,13 @@ static std::string SystemModuleDir() {
     return std::string("/") + (sandboxWord != nullptr ? sandboxWord : "system") + "/common/lib";
 }
 
-static bool LoadGraphicsModules() {
-    if (sPigletModule >= 0) {
+static bool sSystemModulesLoaded = false;
+
+bool LoadSystemModules() {
+    if (sSystemModulesLoaded) {
         return true;
     }
+    sSystemModulesLoaded = true;
 
     const std::string systemDir = SystemModuleDir();
     static const char* const kSystemModules[] = {
@@ -64,6 +68,16 @@ static bool LoadGraphicsModules() {
     for (const char* name : kSystemModules) {
         LoadModule(systemDir + "/" + name + ".sprx");
     }
+    return true;
+}
+
+static bool LoadGraphicsModules() {
+    if (sPigletModule >= 0) {
+        return true;
+    }
+
+    LoadSystemModules();
+    const std::string systemDir = SystemModuleDir();
 
     // Both modules have to come from the same place, they are a matched pair.
     const char* moduleDir = kUserModuleDir;
@@ -104,8 +118,13 @@ static bool LoadGraphicsModules() {
 // EGL / Piglet
 // ---------------------------------------------------------------------------------------------
 
-static constexpr const char* kVsyncMarker = "/data/soh/ps4_vsync";
-static constexpr const char* kNoVsyncMarker = "/data/soh/ps4_novsync";
+// Marker files in the game's data directory (/data/soh, /data/2ship...).
+static std::string VsyncMarker() {
+    return Ship::Context::GetPathRelativeToAppDirectory("ps4_vsync");
+}
+static std::string NoVsyncMarker() {
+    return Ship::Context::GetPathRelativeToAppDirectory("ps4_novsync");
+}
 static bool sVsync = false;
 // SDL_GetTicks64() + 1 while eglSwapBuffers() is running, 0 otherwise.
 static std::atomic<uint64_t> sSwapStartedAt{ 0 };
@@ -116,7 +135,7 @@ static void SwapWatchdog() {
         SDL_Delay(250);
         const uint64_t startedAt = sSwapStartedAt.load();
         if (startedAt != 0 && SDL_GetTicks64() + 1 - startedAt > 4000) {
-            FILE* marker = fopen(kNoVsyncMarker, "w");
+            FILE* marker = fopen(NoVsyncMarker().c_str(), "w");
             if (marker != nullptr) {
                 fputs("eglSwapBuffers blocked with swap interval 1; delete this file to try vsync again\n", marker);
                 fclose(marker);
@@ -320,11 +339,11 @@ bool InitGraphics(int width, int height) {
         return false;
     }
 
-    // Vertical sync is opt-in (create an empty /data/soh/ps4_vsync file): on a real console the
+    // Vertical sync is opt-in (create an empty ps4_vsync file in the data directory): on a real console the
     // game felt clearly worse with a swap interval of 1 than paced by its own timer, any frame
     // that is slightly late waits for a whole extra refresh. The watchdog stays as a safety net,
     // eglSwapBuffers() is known to block forever with some ways of enabling it.
-    sVsync = access(kVsyncMarker, F_OK) == 0 && access(kNoVsyncMarker, F_OK) != 0;
+    sVsync = access(VsyncMarker().c_str(), F_OK) == 0 && access(NoVsyncMarker().c_str(), F_OK) != 0;
     SPDLOG_INFO("[PS4] vsync: {}", sVsync ? "swap interval 1 (ps4_vsync marker found)" : "off, swap interval 0");
     if (!eglSwapInterval(sDisplay, sVsync ? 1 : 0)) {
         SPDLOG_WARN("[PS4] eglSwapInterval failed: 0x{:04X}", (unsigned int)eglGetError());
@@ -427,6 +446,7 @@ static int32_t sUserId = -1;
 
 int32_t GetInitialUserId() {
     if (!sUserServiceReady) {
+        LoadSystemModules();
         // 700 == SCE_KERNEL_PRIO_FIFO_DEFAULT. Fails harmlessly if the service is already up.
         struct {
             int32_t priority;
@@ -541,6 +561,7 @@ void AttachPad() {
     // unfocused applications unless told otherwise. Override so the config can't turn this off.
     SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1", SDL_HINT_OVERRIDE);
 
+    LoadSystemModules();
     const int32_t userId = GetInitialUserId();
 
     int32_t result = scePadInit();
