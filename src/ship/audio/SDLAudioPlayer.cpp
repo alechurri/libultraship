@@ -157,8 +157,8 @@ int SDLAudioPlayer::Buffered() {
     // The system output has no buffer of its own beyond one 256 frame block, so a game tick that
     // runs a little late (20 Hz games refill once every 50 ms) used to drain the queue and cut
     // the sound. Under-report by a fixed cushion: the game's buffering logic then keeps that many
-    // extra frames queued (~40 ms at 32 kHz).
-    constexpr int kCushionFrames = 1280;
+    // extra frames queued.
+    constexpr int kCushionFrames = 3200; // 100 ms at 32 kHz
     const int queued = (int)((sQueue.size() - sQueueRead) / 2);
     return queued > kCushionFrames ? queued - kCushionFrames : 0;
 }
