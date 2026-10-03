@@ -123,6 +123,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLint mBlitPosLocation = -1;
     GLint mBlitUvLocation = -1;
     GLuint mBlitScratchTexture = 0;
+    int mLastScissorX = 0, mLastScissorY = 0, mLastScissorW = 0, mLastScissorH = 0;
 #endif
 
     std::vector<TextureInfo> textures;
@@ -133,7 +134,7 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int8_t mLastBlendEnabled = -1;
     int8_t mLastScissorEnabled = -1;
 
-    std::map<std::pair<uint64_t, uint32_t>, ShaderProgram> mShaderProgramPool;
+    std::map<std::pair<uint64_t, uint64_t>, ShaderProgram> mShaderProgramPool;
     ShaderProgram* mCurrentShaderProgram;
     ShaderProgram* mLastLoadedShader = nullptr;
 

@@ -59,6 +59,10 @@ attribute vec4 aVtxPos;
     @end
 @end
 
+@if(o_prim_depth)
+uniform float prim_depth;
+@end
+
 void main() {
      @for(i in 0..2)
         @if(o_textures[i])
@@ -86,6 +90,11 @@ void main() {
     gl_Position = aVtxPos;
     // No depth clamp on GLES: squeeze clip space z instead so geometry beyond the far plane survives.
     gl_Position.z *= 0.3;
+    @if(o_prim_depth)
+    // G_ZS_PRIM: GLES2 has no gl_FragDepth. The depth is constant over the primitive, so set it
+    // per vertex instead (window depth prim_depth, squeezed like everything else).
+    gl_Position.z = 0.3 * (2.0 * prim_depth - 1.0) * gl_Position.w;
+    @end
 }
 )PS4SHADER";
 

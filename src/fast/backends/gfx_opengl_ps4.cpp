@@ -72,6 +72,10 @@ void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
 }
 
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
+    if (mCurrentShaderProgram->prim_depth_location >= 0) {
+        glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
+    }
+
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
         GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
         glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
@@ -236,7 +240,7 @@ std::optional<std::string> opengl_include_fs(const std::string& path) {
     init->ByteOrder = Ship::Endianness::Native;
     init->Format = RESOURCE_FORMAT_BINARY;
     auto res = std::static_pointer_cast<Ship::Shader>(
-        Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
+        Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, true, init));
     if (res == nullptr) {
         return std::nullopt;
     }
@@ -256,6 +260,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         { "o_alpha_threshold", cc_features.opt_alpha_threshold },
         { "o_invisible", cc_features.opt_invisible },
         { "o_grayscale", cc_features.opt_grayscale },
+        { "o_prim_depth", cc_features.opt_prim_depth },
         { "o_textures", M_ARRAY(cc_features.usedTextures, bool, 2) },
         { "o_masks", M_ARRAY(cc_features.used_masks, bool, 2) },
         { "o_blend", M_ARRAY(cc_features.used_blend, bool, 2) },
@@ -317,6 +322,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
                                      { "o_clamp", M_ARRAY(cc_features.clamp, bool, 2, 2) },
                                      { "o_fog", cc_features.opt_fog },
                                      { "o_grayscale", cc_features.opt_grayscale },
+                                     { "o_prim_depth", cc_features.opt_prim_depth },
                                      { "o_alpha", cc_features.opt_alpha },
                                      { "o_inputs", cc_features.numInputs },
                                      { "update_floats", (InvokeFunc)UpdateFloats },
@@ -404,25 +410,25 @@ static std::string Ps4ShaderListPath() {
     return Ship::Context::GetPathRelativeToAppDirectory("ps4_shaders.txt");
 }
 
-static void Ps4RememberShader(uint64_t shaderId0, uint32_t shaderId1) {
+static void Ps4RememberShader(uint64_t shaderId0, uint64_t shaderId1) {
     if (sWarmingUp) {
         return;
     }
     FILE* file = fopen(Ps4ShaderListPath().c_str(), "a");
     if (file != nullptr) {
-        fprintf(file, "%016llx %08x\n", (unsigned long long)shaderId0, (unsigned int)shaderId1);
+        fprintf(file, "%016llx %016llx\n", (unsigned long long)shaderId0, (unsigned long long)shaderId1);
         fclose(file);
     }
 }
 
 void GfxRenderingAPIOGL::WarmUpShaders() {
-    std::vector<std::pair<uint64_t, uint32_t>> ids;
+    std::vector<std::pair<uint64_t, uint64_t>> ids;
     FILE* file = fopen(Ps4ShaderListPath().c_str(), "r");
     if (file != nullptr) {
         unsigned long long id0 = 0;
-        unsigned int id1 = 0;
-        while (ids.size() < kMaxWarmUpShaders && fscanf(file, "%llx %x", &id0, &id1) == 2) {
-            ids.emplace_back((uint64_t)id0, (uint32_t)id1);
+        unsigned long long id1 = 0;
+        while (ids.size() < kMaxWarmUpShaders && fscanf(file, "%llx %llx", &id0, &id1) == 2) {
+            ids.emplace_back((uint64_t)id0, (uint64_t)id1);
         }
         fclose(file);
     }
@@ -447,9 +453,27 @@ void GfxRenderingAPIOGL::WarmUpShaders() {
     SPDLOG_INFO("[PS4] warmed up {} shaders in {:.1f} s", compiled, seconds);
 }
 
-ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint32_t shader_id1) {
+void GfxRenderingAPIOGL::ClearShaderCache() {
+    // Called when the game changes shader options. Free the programs too: Piglet memory is tight.
+    for (auto& entry : mShaderProgramPool) {
+        glDeleteProgram(entry.second.openglProgramId);
+    }
+    mShaderProgramPool.clear();
+    mCurrentShaderProgram = nullptr;
+    mLastLoadedShader = nullptr;
+}
+
+ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
+    if (cc_features.shader_id != 0 && Fast::gfx_get_shader(cc_features.shader_id) != nullptr) {
+        // Custom shaders pushed by mods are desktop GLSL and can't run on Piglet.
+        static bool sWarned = false;
+        if (!sWarned) {
+            sWarned = true;
+            SPDLOG_WARN("[PS4] custom shader {} requested, using the default one", cc_features.shader_id);
+        }
+    }
     const auto fs_buf = BuildFsShader(cc_features);
     const auto vs_buf = BuildVsShader(cc_features);
     // Runtime compilation goes through Sony's shader compiler module and is not fast: keep a
@@ -464,7 +488,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     ++sShaderCount;
     if (!sWarmingUp) {
         // Only the ones that still interrupted the game are worth a line in the log.
-        SPDLOG_INFO("[PS4] shader #{} ({:016X}/{:08X}) compiled while playing in {:.1f} ms", sShaderCount, shader_id0,
+        SPDLOG_INFO("[PS4] shader #{} ({:016X}/{:016X}) compiled while playing in {:.1f} ms", sShaderCount, shader_id0,
                     shader_id1, compileMs);
     }
     Ps4RememberShader(shader_id0, shader_id1);
@@ -528,6 +552,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
 
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
+    prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
     prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
     prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
     prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
@@ -562,7 +587,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     return prg;
 }
 
-struct ShaderProgram* GfxRenderingAPIOGL::LookupShader(uint64_t shader_id0, uint32_t shader_id1) {
+struct ShaderProgram* GfxRenderingAPIOGL::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
     auto it = mShaderProgramPool.find(std::make_pair(shader_id0, shader_id1));
     return it == mShaderProgramPool.end() ? nullptr : &it->second;
 }
@@ -598,6 +623,9 @@ void GfxRenderingAPIOGL::SelectTexture(int tile, GLuint texture_id) {
 }
 
 void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
     textures[mCurrentTextureIds[mCurrentTile]].width = width;
     textures[mCurrentTextureIds[mCurrentTile]].height = height;
@@ -635,6 +663,13 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl(cmt));
 }
 
+void GfxRenderingAPIOGL::SetCurrentPrimDepth(float depth) {
+    if (depth != mCurrentPrimDepth) {
+        mCurrentPrimDepth = depth;
+        mPrimDepthDirty = true;
+    }
+}
+
 void GfxRenderingAPIOGL::SetDepthTestAndMask(bool depth_test, bool z_upd) {
     mCurrentDepthTest = depth_test;
     mCurrentDepthMask = z_upd;
@@ -650,6 +685,10 @@ void GfxRenderingAPIOGL::SetViewport(int x, int y, int width, int height) {
 
 void GfxRenderingAPIOGL::SetScissor(int x, int y, int width, int height) {
     glScissor(x, y, width, height);
+    mLastScissorX = x;
+    mLastScissorY = y;
+    mLastScissorW = width;
+    mLastScissorH = height;
 }
 
 void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
@@ -686,7 +725,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
             const int n64modeFactor = 120;
             const int noVanishFactor = 100;
             GLfloat SSDB = -2;
-            switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
+            switch (Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
                 // scaled z-fighting (N64 mode like)
                 case 1:
                     if (mFrameBuffers.size() >
@@ -923,6 +962,20 @@ void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
     }
 }
 
+void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
+    // Same as the desktop renderer, but with the scissor state tracked in mLastScissorEnabled
+    // (glGet* round trips are slow on Piglet).
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x, y, w, h);
+    glDepthMask(GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
+    glScissor(mLastScissorX, mLastScissorY, mLastScissorW, mLastScissorH);
+    if (mLastScissorEnabled != 1) {
+        glDisable(GL_SCISSOR_TEST);
+    }
+}
+
 void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
     // MSAA is never enabled on PS4 (mMaxMsaaLevel == 1), nothing to resolve.
 }
@@ -934,7 +987,12 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
-    SelectTexture(tile, mFrameBuffers[fb_id].clrbuf);
+    GLuint texId = mFrameBuffers[fb_id].clrbuf;
+    // FB color buffers are created outside NewTexture(), so the metadata vector may be too short.
+    if (texId >= textures.size()) {
+        textures.resize((size_t)texId + 1);
+    }
+    SelectTexture(tile, texId);
 }
 
 // Draws the [srcX0,srcX1]x[srcY0,srcY1] texel rectangle of `texture` over the
