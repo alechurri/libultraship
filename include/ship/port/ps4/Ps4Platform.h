@@ -25,6 +25,9 @@ bool InitGraphics(int width, int height);
 // Takes down the system's boot splash; call once the first frame is about to be drawn.
 void HideSplashScreen();
 void SwapBuffers();
+// For hang detection: frames presented so far, and whether eglSwapBuffers() is running right now.
+uint64_t GetSwapCount();
+bool IsSwapInProgress();
 void SetSwapInterval(int interval);
 // True when buffer swaps wait for the vertical blank.
 bool IsVsyncActive();

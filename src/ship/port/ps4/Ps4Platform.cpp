@@ -407,6 +407,14 @@ void SwapBuffers() {
     }
 }
 
+uint64_t GetSwapCount() {
+    return sSwapsDone.load();
+}
+
+bool IsSwapInProgress() {
+    return sSwapStartedAt.load() != 0;
+}
+
 bool IsVsyncActive() {
     return sVsync;
 }
